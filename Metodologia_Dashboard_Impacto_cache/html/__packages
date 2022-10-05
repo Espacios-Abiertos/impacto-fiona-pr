@@ -1,0 +1,10 @@
+sf
+ggplot2
+tibble
+stringr
+httr
+tictoc
+dplyr
+DBI
+dataRetrieval
+terra

@@ -1,0 +1,501 @@
+---
+title: "Metodologia - Dashboard Impacto"
+format:
+  html:
+    toc: true
+    toc-title: Tabla de contenidos
+    df-print: paged
+    link-external-newwindow: true
+    link-external-icon: true
+execute: 
+  cache: true
+editor: visual
+---
+
+## 0. Setup
+
+Unos codigos breves para asegurarse que los demas corran apropiadamente
+
+```{r}
+#| output: false
+# Importando algunos paquetes:
+library(sf)
+library(ggplot2)
+library(tibble)
+library(stringr)
+library(httr)
+library(tictoc)
+library(dplyr)
+```
+
+Un mapa de municipios de Puerto Rico:
+
+```{r}
+pr_map <- st_read('municipios_20pct.json')
+pr_map |> 
+  ggplot() +
+  geom_sf() +
+  ggtitle('Mapa de Municipios de Puerto Rico') +
+  theme_light()
+```
+
+Una base de datos para persistir algunas descargas de información:
+
+```{r}
+library(DBI)
+mydb <- dbConnect(RSQLite::SQLite(), "my-db.sqlite")
+```
+
+## 1. Ríos e Inundaciones
+
+Este código tiene como proposito descargar datos sobre las etapas de inundacion de rios en Puerto Rico luego del Huracan Fiona. La fuente principal de información es el Sistema Nacional de Información sobre Agua (NWIS) del Servicio Geológico de los Estados Unidos (USGS).
+
+[![Página del USGS para el monitoreo del Río Guanajibo](usgs-monitoring-rio-guanajibo.png){fig-alt="Captura de pantalla en la pagina de monitoreo del Río Guanajibo. Se destacan tres datos: El ID de la estación monitoreando el río, la gráfica de línea de la altura del río, y el listado de umbrales de inundación correspondientes."}](https://waterdata.usgs.gov/monitoring-location/50138000/#parameterCode=00065&startDT=2022-09-16&endDT=2022-09-23)
+
+En sus "dashboard" de monitoreo, el USGS presenta tres datos esenciales a este analisis:
+
+1.  El nombre e identificador de la estación que monitorea un cuerpo de agua
+2.  La altura del río medida (en pies) por la estación al presente y su historial
+3.  Los umbrales correspondiendo a la altura del cuerpo de agua durante una inundación de dicha magnitud
+
+Obteniendo esos datos para la mayor cantidad posible de estaciones permite analisis cercano de cuales cuerpos de agua se inundaron y a que nivel. Para lograr esto, utilizamos un paquete de R desarrollado por el USGS llamado [{dataRetrieval}](https://github.com/USGS-R/dataRetrieval). Su propósito es facilitar la descarga de datos sobre el agua que disponibiliza el USGS. Esta metodología utiliza exhaustivamente las funciones provistas por este paquete que acceleraron el desarrollo de esta herramienta.
+
+```{r}
+library(dataRetrieval)
+```
+
+### Estaciones del USGS Water Services en Puerto Rico
+
+Inicialmente, se identificaron estaciones de medición que el USGS mantiene en Puerto Rico para monitorear cuerpos de agua:
+
+```{r}
+estacionesPR <- whatNWISsites(stateCd = "PR") |> 
+  st_as_sf(coords = c("dec_long_va", "dec_lat_va"), crs = 4326)
+estacionesPR |> 
+  ggplot() +
+  geom_sf(data=pr_map) +
+  geom_sf(size=0.3, alpha=0.5) +
+  ggtitle(paste0('Hay ',nrow(estacionesPR), ' estaciones del USGS Water Services en Puerto Rico(?)')) +
+  theme_void()
+```
+
+```{r}
+estacionesPR |> as.data.frame()
+```
+
+De estas estaciones, se obtienen aquellas que miden la altura del cuerpo de agua. Esto corresponde a la variable de "Gage height, feet" con un código de parametro de "00065", según la [definición de códigos de parámetros](https://help.waterdata.usgs.gov/codes-and-parameters/parameters "NWIS Definición de Códigos de Parámetros") del NWIS. Aquellas estaciones cumpliendo con este criterio son:
+
+```{r}
+estacionesPR_con_altura <- whatNWISsites(stateCd = "PR", parameterCd = "00065") |> 
+  st_as_sf(coords = c("dec_long_va", "dec_lat_va"), crs = 4326)
+estacionesPR_con_altura |> 
+  ggplot() +
+  geom_sf(data=pr_map) +
+  geom_sf(alpha=0.8) +
+  ggtitle(paste0('Hay ',nrow(estacionesPR_con_altura), ' estaciones midiendo la altura de un cuerpo de agua en Puerto Rico')) +
+  theme_void()
+```
+
+```{r}
+estacionesPR_con_altura |> as.data.frame()
+```
+
+### Umbrales de inundación definidos
+
+Segundo, se extraen aquellas estaciones que tambien tienen umbrales de inundacion definidos. Estos umbrales, tambien conocidos como "flood stages", la [NOAA los define](https://www.nwrfc.noaa.gov/nwrfc/info.cgi "Definicion etapa de inundacion") como:
+
+> la altura establecida del indicador *correspondiente a una localización* sobre cual un alza en la superficie del agua crea un peligro a vidas, propiedad, o comercio
+
+El detalle sobre distinguir cada localización es importante porque cada cuerpo de agua tiene umbrales distintos, y por ende hay que anotar cada uno:
+
+```{r scrape-umbrales-inundacion}
+
+urltemplate <- "https://waterwatch.usgs.gov/webservices/floodstage?site=${sno}&format=json"
+
+etapas_estaciones <- tibble(site_no = character(), action_stage=character(),
+                      flood_stage=character(), moderate_flood_stage=character(),
+                      major_flood_stage=character(), umbral_encontrado=logical())
+empty_row <- etapas_estaciones[1,]
+
+# dbRemoveTable(mydb, "umbrales_inundacion")
+if (!dbExistsTable(mydb, "umbrales_inundacion")) {
+  print("No existe")
+  print("Creando tabla..")
+  dbWriteTable(mydb, "umbrales_inundacion", etapas_estaciones)
+} else {
+  print("Si existe. Importando...")
+  etapas_estaciones <- dbGetQuery(mydb, 'SELECT * FROM umbrales_inundacion')
+}
+
+#  68s 15it  2s-timeout
+# 104s 15it  5s-timeout
+# 232s 15it 10s-timeout
+tic()
+for (i in 1:nrow(estacionesPR_con_altura)) {
+  # if (i > 5) break
+  
+  print(paste(i, '/', nrow(estacionesPR_con_altura)))
+  sno <- estacionesPR_con_altura$site_no[i]
+  if (sno %in% etapas_estaciones$site_no) {
+    print("Ya obtenido. Continuando...")
+    next
+  }
+  url <- ( str_interp(urltemplate, list(sno=sno)))
+  
+  tic()
+  # r <- GET(url, timeout(5))
+  r <- RETRY("GET", url, timeout(5), times=99)
+  rcont <- content(r, "parsed")
+  toc()
+  
+  if ( length(rcont$sites) > 0) {
+    print("Umbral sí fue encontrado.")
+    rsite <- rcont$sites[[1]] %>% purrr::map(~ifelse(is.null(.x), NA, .x))
+    rsite$umbral_encontrado <- TRUE
+    next_row <- as_tibble_row(rsite)
+    # etapas_estaciones <- etapas_estaciones %>% add_row(next_row)
+  } else {
+    print("Ningun umbral fue encontrado.")
+    next_row <- mutate(empty_row, site_no=sno, umbral_encontrado=FALSE)
+    # etapas_estaciones <- etapas_estaciones %>%
+    #   add_row(next_row)
+  }
+  dbAppendTable(mydb, "umbrales_inundacion", next_row)
+  
+  
+  Sys.sleep(2)
+}
+toc()
+
+etapas_estaciones <- dbGetQuery(mydb, 'SELECT * FROM umbrales_inundacion') |> 
+  mutate(umbral_encontrado = as.logical(umbral_encontrado))
+etapas_estaciones
+```
+
+Fuera de las 178 estaciones midiendo la altura del cuerpo de agua, solo 65 definen sus umbrales de inundación:
+
+```{r}
+estacionesPR_con_umbrales <- estacionesPR_con_altura |> 
+  filter(site_no %in% filter(etapas_estaciones, umbral_encontrado)$site_no)
+
+estacionesPR_con_umbrales |> 
+  ggplot() +
+  geom_sf(data=pr_map) +
+  geom_sf(alpha=0.8) +
+  ggtitle(paste0('Hay ',nrow(estacionesPR_con_umbrales), ' estaciones con umbrales de inundación en Puerto Rico')) +
+  theme_void()
+```
+
+```{r}
+estacionesPR_con_umbrales |> as.data.frame()
+```
+
+### Líneas de flujo de ríos
+
+El portal del USGS tambien incluye las líneas de flujos para los ríos que monitorean. Estas son descargadas para propósitos de complementar la visualización.
+
+```{r scrape-rio-flowlines}
+
+tic()
+stagesites_flow <- NULL
+for (i in 1:nrow(estacionesPR_con_umbrales)) {
+  print(paste(i, '/', nrow(estacionesPR_con_umbrales)))
+  tic()
+  siteInfo <- estacionesPR_con_umbrales[i,]
+  siteNo <- siteInfo$site_no
+  
+  site_flowlines <- findNLDI(nwis = siteNo, 
+                          nav = c("UM", "DM"), 
+                          find = c("flowlines"),
+                          distance_km = 999
+                          )
+
+  if ((length(site_flowlines) == 0) | (!("UM_flowlines" %in% names(site_flowlines)))) {
+    print(paste0("Skipping ", siteNo, " pq no encontramos datos de rio"))
+    next
+  }
+  siteUM <- site_flowlines$UM_flowlines %>% 
+    dplyr::mutate(site_no = siteNo, nav = "UM")
+  
+  siteDM <- site_flowlines$DM_flowlines %>% 
+    dplyr::mutate(site_no = siteNo, nav = "DM")
+  
+  siteFlow <- rbind(siteUM, siteDM)
+  
+  if (is.null(stagesites_flow)) {
+    stagesites_flow <- siteFlow
+  } else {
+    stagesites_flow <- rbind(stagesites_flow, siteFlow)
+  }
+  toc()
+  
+  # if (i==1) break
+}
+toc()
+
+# stagesites_flow <- stagesites_flow %>% 
+#   # select(-stage) %>%
+#   merge(select(stagesites_crossed, site_no, stage), by='site_no') %>%
+#   arrange(stage)
+stagesites_flow
+```
+
+```{r}
+ggplot() + 
+  geom_sf(data = pr_map) +
+  geom_sf(data = stagesites_flow, color='blue') +
+  geom_sf(data = estacionesPR_con_umbrales, color='black', size=1.5, shape=18) +
+  theme_void()
+```
+
+### Historial de altura de ríos
+
+El último dato necesario para completar este análisis es el historial de la altura de cada río a evaluar. Con esta información, podemos determinar cuantos ríos se inundaron.
+
+```{r scrape-historial-altura-rios}
+
+stagesites_ts <- NULL
+for (i in 1:nrow(estacionesPR_con_umbrales)) {
+  print(paste(i, '/',  nrow(estacionesPR_con_umbrales)))
+  siteInfo <- estacionesPR_con_umbrales[i,]
+  siteNo <- siteInfo$site_no
+  stages <- etapas_estaciones %>% 
+    dplyr::filter(site_no == siteNo) %>% dplyr::select(-site_no) %>% as.list()
+  pCode <- "00065"
+  start.date <- "2022-09-16"
+  end.date <- "2022-09-23"
+  
+  sitets <- readNWISuv(siteNumbers = siteNo,
+                       parameterCd = pCode,
+                       startDate = start.date,
+                       endDate = end.date)
+  sitets <- renameNWISColumns(sitets)
+  sitets
+  
+  if (is.null(stagesites_ts)) {
+    stagesites_ts <- sitets
+  } else {
+    stagesites_ts <- rbind(stagesites_ts, sitets)
+  }
+  
+  # if (i==3) break
+}
+
+stagesites_ts
+```
+
+### Umbrales de inundación cruzados
+
+Por ejemplo, este es el historial de altura del Rio Guanajibo en Hormigueros durante el Huracán Fiona:
+
+```{r}
+rioguanajibo <- stagesites_ts |> dplyr::filter(site_no == 50138000)
+rioguanajibo_umbrales <- etapas_estaciones %>% 
+    dplyr::filter(site_no == 50138000) %>% dplyr::select(-site_no) %>% as.list()
+parameterInfo <- attr(rioguanajibo, "variableInfo")
+
+rioguanajibo |> 
+ggplot(aes(dateTime, GH_Inst)) +
+  geom_point() +
+  xlab("") +
+  ylab(parameterInfo$variableDescription) +
+  ggtitle('Río Guanajibo - ID 50138000') +
+  geom_hline(yintercept = as.numeric(rioguanajibo_umbrales)) +
+  theme_light()
+```
+
+Estos datos crudos indican que el Río Guanajibo sobrepasó el mayor nivel de inundación. Se resume esta información obteniendo la altura máxima de cada río durante el transcurso del huracán y comparandola a sus umbrales:
+
+```{r}
+
+# Altura máxima de cada río
+stagesites_max <-
+stagesites_ts %>% 
+  group_by(site_no) %>% 
+  arrange(-GH_Inst) %>% 
+  filter(row_number()==1) %>% 
+  ungroup()
+
+stage_levels <- c("none_stage", "action_stage", "flood_stage", "moderate_flood_stage", "major_flood_stage")
+
+estacionesPR_umbrales_cruzados <-
+stagesites_max %>% merge(etapas_estaciones, by='site_no', how='left') %>% 
+  mutate(none_stage = "0", across(ends_with("stage"), as.numeric)) %>% 
+  tidyr::pivot_longer(ends_with('_stage'), names_to='stage', values_to='GH_stage') %>% 
+  mutate(over_stage = GH_Inst >= GH_stage) %>% 
+  group_by(site_no) %>% 
+  filter(over_stage==TRUE) %>% 
+  arrange(site_no, -GH_stage) %>% 
+  filter(row_number() == 1) %>% 
+  dplyr::ungroup() %>% 
+  mutate(stage = factor(stage, levels=stage_levels))
+
+estacionesPR_umbrales_cruzados
+
+```
+
+Y graficandolos estos niveles de inundación serían:
+
+```{r}
+stage_colors <- c(none_stage = 'grey', action_stage='green',
+                     flood_stage='yellow',moderate_flood_stage='orange',
+                     major_flood_stage='red')
+
+estacionesPR_umbrales_cruzados_con_rios <-
+estacionesPR_umbrales_cruzados |> 
+  merge(stagesites_flow, how='left', by='site_no') |> 
+  merge(st_drop_geometry(estacionesPR_con_umbrales), how='left', by='site_no')
+
+estacionesPR_umbrales_cruzados_con_rios |> 
+  ggplot() +
+  geom_sf(data = pr_map) +
+  geom_sf(aes(geometry=geometry, color=stage)) +
+  geom_sf(data=estacionesPR_con_umbrales, color='black') +
+  scale_color_manual(values = stage_colors) +
+  theme_void() +
+  ggtitle("Ríos inundados en Puerto Rico segun el USGS") +
+  theme(legend.position="bottom")
+  
+```
+
+### Exportando los ríos y sus niveles de inundación
+
+Se guardan ambos las lineas de flujo de los ríos y sus niveles de inundación en un archivo GeoJSON para uso en Tableau:
+
+```{r}
+estacionesPR_umbrales_cruzados_con_rios
+```
+
+```{r export-inundaciones-rios}
+estacionesPR_umbrales_cruzados_con_rios %>% 
+  arrange(stage) %>% 
+  st_write('output/estacionesPR_umbrales_cruzados_con_rios.geojson',
+           delete_dsn=TRUE) # rios_attempt_2 en Tableau, mas o menos
+```
+
+## 2. Precipitación acumulada por municipio
+
+Esta metodología utiliza como fuente el Advanced Hydrological Prediction Service del NOAA. Ellos archivan observaciones pasadas de lluvias acumuladas durante un set periodo de días y disponibilizan su uso.
+
+### Descarga de datos
+
+[![Portal de descargas del Advanced Hydrological Prediction Service del NOAA](NOAA-NWS-AHPS-screenshot.png){fig-alt="Un formulario para descargar los datos de precipitacion. Flechas apuntan a los botones a seleccionar para descargar el dato correcto."}](https://water.weather.gov/precip/download.php)
+
+Para obtener los datos de precipitación, se accesa el [portal del NOAA](https://water.weather.gov/precip/download.php) y eligen las siguientes opciones:
+
+1.  Tiempo: Diario
+2.  Formato: GeoTIFF
+3.  Time Range: Día
+4.  Fecha: 23 de Septiembre de 2022
+5.  Descarga: Últimos 7 días
+
+Antes de confirmar la descarga usando el botón etiquetado 'Download', el portal debería mencionar que se incluye un archivo titulado `nws_precip_last7days_20220923_pr.tif` . Este archivo .tif corresponde a la región de Puerto Rico y es adjuntado junto a este documento.
+
+### Abrir el archivo GeoTIFF
+
+Formatos tipo 'raster' como el GeoTIFF descargado requieren paquetes como `{terra}` para abrirlos a través de R. Este paquete provee funciones para manipular la "imagen" de datos provista por NOAA y resumirla a nivel municipal.
+
+```{r}
+#| output: false
+library(terra)
+```
+
+```{r}
+#| output: false
+# Mapa de Puerto Rico
+pr_terra<-vect(pr_map)
+pr_extent<-ext(pr_terra)
+```
+
+```{r}
+lluvia_raster <- rast("nws_precip_last7days_20220923_pr.tif") %>%
+  project("epsg:4326") %>% 
+  crop(pr_extent)
+names(lluvia_raster) <- c('observation_in', 'PRISM_in', 'departure_in', 'perc_normal')
+plot(lluvia_raster)
+```
+
+```{r}
+#| fig-cap: Mapa con pulgadas de lluvia recibidas entre el 16-22 de Septiembre de 2022
+plot(  lluvia_raster[[1]], main='Observación pulgadas de precipitación - 7 dias atras desde 23-Sep-2022' )
+lines(pr_terra)
+```
+
+### Máximo por municipio
+
+Las pulgadas de lluvia que recibio cada municipio no estuvierion distribuidas igualmente. No obstante, se elige lo máximo que fue observado dentro de los límites de cada municipio:
+
+```{r}
+max_lluvia <- NULL
+for (i in 1:nrow(pr_terra)) {
+  muni_terra <- pr_terra[i,]
+  muni <- muni_terra$municipio
+  muni_lluvia_max <- lluvia_raster[[1]] %>% extract(muni_terra) %>% max()
+  muni_tibble <- tibble(municipio = muni, lluvia = muni_lluvia_max)
+  
+  if (is.null(max_lluvia)) {
+    max_lluvia <- muni_tibble
+  } else {
+    max_lluvia <- rbind(max_lluvia, muni_tibble)
+  }
+}
+
+max_lluvia <- max_lluvia |> 
+  mutate(lluvia = round(lluvia,1)) |> 
+  merge(select(pr_map, municipio), how='left', by='municipio')
+max_lluvia
+```
+
+```{r}
+max_lluvia |>
+  ggplot() +
+  geom_sf(color='white', lwd=0.1, aes(fill=lluvia, geometry=geometry)) +
+  theme_void() +
+  scale_fill_continuous(name = "Pulgadas de lluvia") +
+  theme(legend.position="bottom") +
+  ggtitle("Precipitación recibida por municipio")
+```
+
+### Exportando datos de lluvia
+
+Se exporta un csv con el municipio y la cantidad de lluvia para uso con Tableau:
+
+```{r}
+max_lluvia |> 
+  select(-geometry) |> 
+  readr::write_csv('lluvias_maximas_municipios.csv')
+```
+
+## 3. Hilera de Vientos
+
+[![Hilera de vientos del Huracán Fiona (Fuente: NOAA)](noaa-post-fiona-wind-swaths.png){fig-alt="Un mapa enseñando el paso del Huracán Fiona a lo largo del Oceano Atlántico. Se pinta una región grande de color amarillo representando areas impactadas por vientos de fuerza de tormenta tropical. Centrado en esta area, tambien hay pintado una franja roja para demostrar las areas afectadas por vientos huracanados. Arriba se apunta hacia el link a darle click para descargar los datos en formato GIS."}](https://www.nhc.noaa.gov/refresh/graphics_at2+shtml/204227.shtml?swath#contents)
+
+El Centro Nacional de Huracanes (NHC) de la Administración Nacional Oceánica y Atmosférica (NOAA) publicó un [reporte de datos meteorológicos post-huracán](https://www.nhc.noaa.gov/refresh/graphics_at2+shtml/204227.shtml?swath#contents "Reporte Post-Huracan Fiona") para Fiona. Incluido es un historial o hilera de vientos que ilustran la magnitud de vientos que abatieron cada area tras el paso del huracán.
+
+La región sombreada en dorado cubre areas impactadas por vientos de intensidad de tormenta tropical. Las areas en rojo correspondén a regiones que recibieron vientos huracanados.
+
+Encima del gráfico del reporte, NOAA incluye un [enlace para descargar esta hilera](https://www.nhc.noaa.gov/gis/best_track/al072022_best_track.zip "GIS de hilera Huracán Fiona") en un formato GIS-compatible (ShapeFile). Como parte de esta metodología, descargamos el archivo ShapeFile y lo convertimos a formato GeoJSON a través de la herramienta [MapShaper](mapshaper.org "MapShaper"). Este archivo convertido se adjuntó a este documento.
+
+```{r}
+# Leer archivo GeoJSON de la hilera del huracán
+hilera_fiona <- st_read('AL072022_windswath.json')
+
+# Graficar hilera
+hilera_fiona |> 
+  ggplot() +
+  geom_sf(lwd=0, aes(fill=STRRADII)) +                 # Color segun variable STRADII
+  scale_fill_manual(name="Categoría de Vientos (kts)", # Cual color a cual categoría
+                    values=c("34"="#f4a100","50"="#f4a100","64"="#a93440")) +
+  ggtitle('Hilera de vientos del Huracán Fiona') +
+  theme_light()
+```
+
+Este GeoJSON luego se envía para graficar en la plataforma de Tableau, donde se ajustan los colores y nombres de las categorías para presentación.
+
+## Referencias
+
+### dataRetrieval
+
+```{r}
+citation(package = "dataRetrieval")
+```
