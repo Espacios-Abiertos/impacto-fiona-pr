@@ -12,23 +12,30 @@ execute:
 editor: visual
 ---
 
+[![Dashboard de Vulnerabilidad e impacto del Huracan Fiona por municipio](images/paste-B810CAF5.png){fig-alt="Captura de pantalla del dashboard de vulnerabilidad e impacto hecho en Tableau"}](https://public.tableau.com/app/profile/espacios.abiertos/viz/VulnerabilidadeimpactodelHuracnFionapormunicipio/IndicadoresdeVulnerabilidad)
+
+Esta documentación es realizada para abonar detalles sobre el proceso para obtener datos de impacto en el [Dashboard de Vulnerabilidad e impacto del Huracán Fiona](https://public.tableau.com/app/profile/espacios.abiertos/viz/VulnerabilidadeimpactodelHuracnFionapormunicipio/IndicadoresdeVulnerabilidad) desarrollado por Espacios Abiertos. Abarca los datos relacionados a ríos, inundaciones, precipitación y la hilera de vientos.
+
+El lenguaje de programación utilizado en este tutorial es R, pero la mayoría de estos pasos deberían ser replicables desde otros lenguajes como Python. Esta documentación como tal fue generada utilizando [Quarto](https://quarto.org/ "Quarto").
+
 ## 0. Setup
 
-Unos codigos breves para asegurarse que los demas corran apropiadamente
+Antes que nada, hace falta utilizar unos codigos breves para asegurarse que los demas corran apropiadamente. Importamos muchos paquetes de R que seran usados subsiguientemente:
 
 ```{r}
 #| output: false
 # Importando algunos paquetes:
-library(sf)
-library(ggplot2)
-library(tibble)
-library(stringr)
-library(httr)
-library(tictoc)
-library(dplyr)
+
+library(sf)         # Para crear mapas y manipular datos geoespaciales
+library(ggplot2)    # Para realizar los gráficas y algunos mapas
+library(tibble)     # Para manejar tablas de datos
+library(stringr)    # Para manipular valores de tipo caracteres
+library(httr)       # Para descargar datos de APIs y websites
+library(tictoc)     # Para medir cuanto tiempo toman pedazos de codigo en correr
+library(dplyr)      # Para todo relacionado a manipular datos
 ```
 
-Un mapa de municipios de Puerto Rico:
+Tambien traemos un mapa de municipios de Puerto Rico para utilizar en visualizaciones:
 
 ```{r}
 pr_map <- st_read('municipios_20pct.json')
@@ -39,7 +46,7 @@ pr_map |>
   theme_light()
 ```
 
-Una base de datos para persistir algunas descargas de información:
+Finalmente, creamos una base de datos para persistir algunas descargas de información. No es necesario crear una, pero utilizarla elimina la necesidad de descargar TODOS los datos cada vez que se actualize la documentación. Por ende, pone menos presión a los servidores que nos envian los datos (y previene que nos blockeen por sobre-utilizarlos).
 
 ```{r}
 library(DBI)
@@ -195,7 +202,7 @@ estacionesPR_con_umbrales |> as.data.frame()
 El portal del USGS tambien incluye las líneas de flujos para los ríos que monitorean. Estas son descargadas para propósitos de complementar la visualización.
 
 ```{r scrape-rio-flowlines}
-
+#| cache: true
 tic()
 stagesites_flow <- NULL
 for (i in 1:nrow(estacionesPR_con_umbrales)) {
@@ -282,6 +289,66 @@ for (i in 1:nrow(estacionesPR_con_umbrales)) {
 }
 
 stagesites_ts
+```
+
+### Interactivo de historial de ríos
+
+```{r}
+#| cache: false
+ojs_define(stagesites_ts_data = stagesites_ts)
+ojs_define(estacionesPR_con_umbrales = estacionesPR_con_umbrales)
+```
+
+```{ojs ojs-setup}
+import {taker, filter} from "@mbostock/manipulating-flat-arrays"
+d3 = require("d3@7")
+
+dateFormat = d3.timeParse("%Y-%m-%d %H:%M:%S")
+
+stagesites_ts_objs = transpose(stagesites_ts_data).map(d => {
+  return {
+  GH_Inst: d.GH_Inst,
+  GH_Inst_cd: d.GH_Inst_cd,
+  agency_cd: d.agency_cd,
+  dateTime: dateFormat( d.dateTime ),
+  site_no: d.site_no,
+  tz_cd: d.tz_cd,
+}
+})
+
+iarr = [...Array(estacionesPR_con_umbrales.site_no.length).keys()] 
+```
+
+```{ojs ojs-siteNo}
+siteNo
+```
+
+```{ojs ojs-historial-plot}
+#| echo: false
+#| code-fold: true
+
+viewof siteNo = Inputs.select(iarr, {label: "Estación", 
+            format: i => estacionesPR_con_umbrales.station_nm[i],
+            valueof: i => estacionesPR_con_umbrales.site_no[i],
+            value: "50138000",
+            })
+Plot.plot({
+  x: {
+    ticks: 10,
+    grid: false,
+    label: "Fecha",
+    //axis: null,
+    // ticks: "5",
+    // domain: d3.extent(stagesites_ts_data.dateTime)
+  },
+  y: {
+    grid: true,
+    label: "↑ Altura del río (pies)",
+  },
+  marks: [
+    Plot.line(stagesites_ts_objs.filter(d => d.site_no === siteNo), {x: "dateTime", y: "GH_Inst"})
+  ]
+})
 ```
 
 ### Umbrales de inundación cruzados
